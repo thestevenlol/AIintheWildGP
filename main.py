@@ -10,7 +10,7 @@ def main():
     GestureRecognizerOptions = mp.tasks.vision.GestureRecognizerOptions
     VisionRunningMode = mp.tasks.vision.RunningMode
     
-    model_path = '/home/jack/College/AIintheWildGP/models/gesture_recognizer.task'
+    model_path = 'models/gesture_recognizer.task'
     base_options = BaseOptions(model_asset_path=model_path)
     
     # Store latest results
