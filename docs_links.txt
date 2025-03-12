@@ -1,0 +1,2 @@
+https://ai.google.dev/edge/mediapipe/solutions/vision/gesture_recognizer/python
+https://ai.google.dev/edge/mediapipe/solutions/vision/gesture_recognizer/index#models
