@@ -17,6 +17,7 @@ def main():
     result_dict = {'gestures': []}
     
     def print_result(result: GestureRecognizerResult, output_image: mp.Image, timestamp_ms: int):
+        
         # Store the result for use in main loop
         result_dict['gestures'] = result.gestures
         if result.gestures:
@@ -56,7 +57,11 @@ def main():
             # Display gesture information on the frame if available
             if result_dict['gestures']:
                 top_gesture = result_dict['gestures'][0][0]
-                cv2.putText(frame, f"{top_gesture.category_name}: {top_gesture.score:.2f}", 
+                if top_gesture.category_name == 'Victory':
+                    cv2.putText(frame, f"Fuck you: {top_gesture.score:.2f}", 
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                else:   
+                    cv2.putText(frame, f"{top_gesture.category_name}: {top_gesture.score:.2f}", 
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
             
             # Display the frame
