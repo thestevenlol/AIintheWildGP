@@ -59,7 +59,7 @@ frame_center_when_scanned = None # Store center point during scan
 # --- Processing Loop ---
 while True:
     frame = tello.get_frame_read().frame
-    if frame is not None:
+    if frame is None:
         print("Failed to grab frame")
         break
 
