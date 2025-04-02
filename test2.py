@@ -1,65 +1,58 @@
 import cv2
 import numpy as np
-import math
-from enum import Enum # For states
-from djitellopy import Tello
+import math # For atan2
 
-# --- States ---
-class DroneState(Enum):
-    IDLE = 0
-    SCANNING = 1
-    PATH_STORED = 2
-    EXECUTING = 3
-    EXECUTION_DONE = 4
+# --- Constants (Adjust these!) ---
 
-# --- Constants ---
-LOWER_GREEN = np.array([0, 0, 0])  
-UPPER_GREEN = np.array([180, 255, 30])
-KERNEL_SIZE = 3
-MORPH_ITERATIONS = 1
-MIN_CONTOUR_AREA = 100
+# Grayscale Threshold (Lower value detects darker pixels as "black")
+# Tune this based on your lighting and how black the line is vs the background.
+# Values typically range from 50 to 150. Start around 100.
+GRAYSCALE_THRESHOLD = 40 # Pixels below this value are considered black
 
-# --- Path Following Parameters ---
-# How much to simplify the contour. Smaller value = more points, closer fit.
-# Value is epsilon factor for approxPolyDP (percentage of arc length)
-CONTOUR_SIMPLIFICATION_FACTOR = 0.007 # Try values between 0.005 and 0.02
+# Morphological Kernel Size
+KERNEL_SIZE = 1 # Often needs to be slightly larger for thresholded images
 
-# --- CRITICAL ASSUMPTION: Scale Factor ---
-# How many meters in the real world correspond to one pixel?
-# This MUST be calibrated based on drone distance and camera FOV.
-# Example: If drone is 1m away and 100 pixels span 0.2m horizontally,
-# scale = 0.2 / 100 = 0.002 meters/pixel
-PIXELS_TO_METERS_SCALE = 0.002 # <--- !!! ADJUST THIS VALUE (Calibration Needed) !!!
+# Morphological Iterations
+MORPH_ITERATIONS = 2 # Might need more iterations to clean up threshold noise
 
-# --- Drone Simulation ---
-stored_path_pixels = []
-stored_path_meters_relative = []
-current_waypoint_index = 0
+# Minimum Contour Area (Filter out small noise) - ADJUST THIS!
+MIN_CONTOUR_AREA = 150 # Pixels (adjust based on line thickness and distance)
 
-tello = Tello()
-tello.connect()
-tello.streamon()
+# --- Control Parameters ---
+# Horizontal Target Offset: Keep centroid slightly left of center (fraction of width)
+HORIZONTAL_TARGET_OFFSET_FRACTION = 0.0 # Target center for simplicity first
+# Horizontal Deadzone: How far from target before correcting (fraction of width)
+HORIZONTAL_DEADZONE_FRACTION = 0.15    # Correct if centroid > +/- 15% from target X
 
-def simulate_drone_goto(target_meters_relative):
-    """Simulates telling the drone to move to a relative position."""
-    # Assumes target is relative to where the drone was when execution started.
-    # Assumes Drone Frame: +X is Right, +Y is UP, +Z is Forward (away from wall)
-    # We only care about X and Y for wall tracing.
-    print(f"SIM DRONE: GOTO Relative Waypoint (X, Y): ({target_meters_relative[0]:.3f}, {target_meters_relative[1]:.3f}) meters")
-    # In a real system:
-    # drone.goto_position_relative(target_meters_relative[0], target_meters_relative[1], 0, speed=...)
-    # wait_until_drone_reaches_target()
+# Vertical Slope Threshold: dy/dx threshold to trigger UP/DOWN
+# Steeper than this slope -> move UP/DOWN. Flatter -> HOVER vertically.
+# Adjust based on how sharp curves you expect. Higher value = less sensitive.
+VERTICAL_SLOPE_THRESHOLD = 0.3 # tan(angle) approx. 17 degrees
 
-cv2.namedWindow("Path Scanner/Executor")
-cv2.namedWindow("Green Mask")
+# Minimum Horizontal Span (dx) for Slope Calculation
+# Don't trust slope if line segment is too vertical or short horizontally
+MIN_DX_FOR_SLOPE = 20 # Pixels
 
-state = DroneState.IDLE
-frame_center_when_scanned = None # Store center point during scan
+# --- Drone Command Placeholder (Prints to Console) ---
+def send_drone_command(command):
+    """Prints the intended drone command to the console."""
+    print(f"COMMAND: {command}")
+    # In a real application, you would send commands here
+
+# --- Webcam Setup ---
+cam = cv2.VideoCapture(0)
+
+if not cam.isOpened():
+    print("Error: Could not open webcam.")
+    exit()
+
+cv2.namedWindow("Line Following View (Black Line)")
+cv2.namedWindow("Black Line Mask (Refined)")
 
 # --- Processing Loop ---
 while True:
-    frame = tello.get_frame_read().frame
-    if frame is None:
+    ret, frame = cam.read()
+    if not ret:
         print("Failed to grab frame")
         break
 
@@ -67,170 +60,161 @@ while True:
     frame_center_x = frame_width // 2
     frame_center_y = frame_height // 2
 
-    # --- Image Processing ---
-    hsv_image = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    initial_mask = cv2.inRange(hsv_image, LOWER_GREEN, UPPER_GREEN)
+    # Calculate target X based on offset
+    target_cx = frame_center_x + int(HORIZONTAL_TARGET_OFFSET_FRACTION * frame_width)
+
+    # --- Image Processing for Black Line ---
+    # 1. Convert to Grayscale
+    gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # 2. Apply Binary Threshold (Inverted)
+    # Pixels below GRAYSCALE_THRESHOLD become white (255), others become black (0)
+    # This makes the black line white in the mask, which findContours expects.
+    ret, thresh_mask = cv2.threshold(gray_image, GRAYSCALE_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+
+    # 3. Morphological Operations (Closing) - To fill gaps in the line and remove noise
     kernel = np.ones((KERNEL_SIZE, KERNEL_SIZE), np.uint8)
-    refined_mask = cv2.morphologyEx(initial_mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_ITERATIONS)
+    # Closing = Dilation followed by Erosion
+    refined_mask = cv2.morphologyEx(thresh_mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_ITERATIONS)
+    # Optional: Add Opening (Erosion then Dilation) to remove small white noise specks (background noise)
+    # refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, kernel, iterations=1) # Uncomment if needed
 
-    # Make a copy for drawing without affecting calculations
-    display_frame = frame.copy()
+    # --- Contour Detection and Filtering ---
+    # Find contours on the refined mask (where the line should be white)
+    contours, hierarchy = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # --- State Machine Logic ---
-    if state == DroneState.IDLE:
-        cv2.putText(display_frame, "State: IDLE. Press 's' to Scan.", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+    largest_contour = None
+    max_area = 0
+    line_found = False
+    cx, cy = 0, 0 # Centroid coordinates
+    leftmost_pt = None
+    rightmost_pt = None
+    line_angle_deg = 0
 
-    elif state == DroneState.SCANNING:
-        cv2.putText(display_frame, "State: SCANNING...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        contours, hierarchy = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area > MIN_CONTOUR_AREA and area > max_area:
+                max_area = area
+                largest_contour = contour
 
-        largest_contour = None
-        max_area = 0
-        if contours:
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > MIN_CONTOUR_AREA and area > max_area:
-                    max_area = area
-                    largest_contour = contour
+    # --- Analysis if Line Found ---
+    command_h = "HOVER_H" # Horizontal component (LEFT, RIGHT, HOVER_H)
+    command_v = "HOVER_V" # Vertical component (UP, DOWN, HOVER_V)
+    final_command = "SEARCH" # Default if no line
 
-        if largest_contour is not None:
-            # Simplify the contour
-            perimeter = cv2.arcLength(largest_contour, True)
-            epsilon = CONTOUR_SIMPLIFICATION_FACTOR * perimeter
-            simplified_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+    if largest_contour is not None:
+        line_found = True
+        final_command = "HOVER" # Default if line is found but centered/flat
 
-            # Store the path (pixel coordinates)
-            # Ensure it's a simple list of (x, y) tuples
-            stored_path_pixels = [tuple(pt[0]) for pt in simplified_contour]
+        # Calculate centroid
+        M = cv2.moments(largest_contour)
+        if M["m00"] != 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
 
-            if len(stored_path_pixels) > 1:
-                 # Store the frame center at the time of scanning for relative calculations
-                frame_center_when_scanned = (frame_center_x, frame_center_y)
-                print(f"Path Scanned: {len(stored_path_pixels)} waypoints found.")
-                state = DroneState.PATH_STORED
+            # Find leftmost and rightmost points of the contour
+            leftmost_pt = tuple(largest_contour[largest_contour[:, :, 0].argmin()][0])
+            rightmost_pt = tuple(largest_contour[largest_contour[:, :, 0].argmax()][0])
+
+            # Draw contour, centroid, and end points on the original frame
+            cv2.drawContours(frame, [largest_contour], -1, (0, 255, 0), 2) # Green contour
+            cv2.circle(frame, (cx, cy), 7, (0, 0, 255), -1) # Red centroid
+            cv2.circle(frame, leftmost_pt, 5, (255, 0, 0), -1) # Blue left
+            cv2.circle(frame, rightmost_pt, 5, (0, 255, 255), -1) # Yellow right
+            if leftmost_pt and rightmost_pt:
+                 cv2.line(frame, leftmost_pt, rightmost_pt, (255, 0, 255), 1) # Magenta line segment
+
+            # --- Determine Horizontal Command (Turning) ---
+            h_deadzone_pixels = int(HORIZONTAL_DEADZONE_FRACTION * frame_width / 2)
+            left_bound = target_cx - h_deadzone_pixels
+            right_bound = target_cx + h_deadzone_pixels
+
+            if cx < left_bound:
+                command_h = "LEFT"
+            elif cx > right_bound:
+                command_h = "RIGHT"
             else:
-                print("Scan failed: Not enough points in simplified contour.")
-                state = DroneState.IDLE # Go back to idle if scan fails
+                command_h = "HOVER_H" # Horizontally within deadzone of target
+
+            # --- Determine Vertical Command (Up/Down based on slope) ---
+            dx = rightmost_pt[0] - leftmost_pt[0]
+            # Note: Image coordinates: Positive dy means downwards on the screen
+            dy = rightmost_pt[1] - leftmost_pt[1]
+
+            if abs(dx) > MIN_DX_FOR_SLOPE: # Check if segment is wide enough horizontally
+                slope = dy / dx
+                line_angle_deg = math.degrees(math.atan2(-dy, dx)) # Angle CCW from positive X axis
+
+                # If the line goes up on screen (left to right), dy is negative, slope is negative
+                if slope < -VERTICAL_SLOPE_THRESHOLD: # Significantly upwards slope on screen
+                    command_v = "UP"
+                # If the line goes down on screen (left to right), dy is positive, slope is positive
+                elif slope > VERTICAL_SLOPE_THRESHOLD: # Significantly downwards slope on screen
+                    command_v = "DOWN"
+                else: # Mostly horizontal slope
+                    command_v = "HOVER_V"
+            else:
+                # Line is near vertical or very short horizontally
+                # Use centroid's vertical position relative to center as fallback
+                if cy < frame_center_y - 30: # Above center (adjust threshold as needed)
+                     command_v = "UP"
+                elif cy > frame_center_y + 30: # Below center (adjust threshold as needed)
+                     command_v = "DOWN"
+                else:
+                     command_v = "HOVER_V" # Vertically centered
+
+            # --- Combine Commands (Prioritize Turning) ---
+            if command_h != "HOVER_H":
+                final_command = command_h # Turn if needed
+            elif command_v != "HOVER_V":
+                final_command = command_v # Move vertically if horizontally ok
+            else:
+                final_command = "HOVER" # Stay put if centered and flat segment
+
         else:
-            print("Scan failed: No suitable contour found.")
-            state = DroneState.IDLE # Go back to idle if scan fails
+             # Centroid calculation failed (m00 was zero)
+             line_found = False
+             final_command = "HOVER" # Or maybe SEARCH? Hover seems safer.
+
+    else:
+        # No significant contour found
+        line_found = False
+        final_command = "SEARCH"
+
+    # --- Send Command to Console ---
+    send_drone_command(final_command)
+
+    # --- Display Information ---
+    # Draw target X and deadzone
+    cv2.line(frame, (target_cx, 0), (target_cx, frame_height), (0, 255, 0), 1) # Green target X
+    left_bound_viz = target_cx - int(HORIZONTAL_DEADZONE_FRACTION * frame_width / 2)
+    right_bound_viz = target_cx + int(HORIZONTAL_DEADZONE_FRACTION * frame_width / 2)
+    cv2.line(frame, (left_bound_viz, 0), (left_bound_viz, frame_height), (255, 255, 0), 1) # Cyan left bound
+    cv2.line(frame, (right_bound_viz, 0), (right_bound_viz, frame_height), (255, 255, 0), 1) # Cyan right bound
 
 
-    elif state == DroneState.PATH_STORED:
-        cv2.putText(display_frame, f"State: PATH STORED ({len(stored_path_pixels)} pts). Press 'g' to Go.", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        # Draw the stored path
-        if len(stored_path_pixels) > 1:
-            cv2.polylines(display_frame, [np.array(stored_path_pixels)], isClosed=False, color=(0, 255, 0), thickness=3)
-            for i, pt in enumerate(stored_path_pixels):
-                 cv2.circle(display_frame, pt, 4, (0, 0, 255), -1)
-                 cv2.putText(display_frame, str(i), (pt[0]+5, pt[1]+5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
+    cv2.putText(frame, f"Command: {final_command}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    if line_found:
+        cv2.putText(frame, f"Centroid: ({cx}, {cy}) TargetX: {target_cx}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        cv2.putText(frame, f"L:{leftmost_pt} R:{rightmost_pt}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        cv2.putText(frame, f"Angle: {line_angle_deg:.1f} deg", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        cv2.putText(frame, f"Threshold: {GRAYSCALE_THRESHOLD}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+    else:
+         cv2.putText(frame, "Line not found", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+         cv2.putText(frame, f"Threshold: {GRAYSCALE_THRESHOLD}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
 
-    elif state == DroneState.EXECUTING:
-        cv2.putText(display_frame, f"State: EXECUTING Waypoint {current_waypoint_index}/{len(stored_path_meters_relative)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    cv2.imshow("Black Line Mask (Refined)", refined_mask)
+    cv2.imshow("Line Following View (Black Line)", frame)
 
-        # Draw the full target path
-        if len(stored_path_pixels) > 1:
-             cv2.polylines(display_frame, [np.array(stored_path_pixels)], isClosed=False, color=(0, 165, 255), thickness=2) # Orange full path
-
-        # Highlight current target waypoint
-        if current_waypoint_index < len(stored_path_pixels):
-            target_pixel_pt = stored_path_pixels[current_waypoint_index]
-            cv2.circle(display_frame, target_pixel_pt, 8, (0, 0, 255), -1) # Highlight target
-
-
-        # --- SIMULATE DRONE ACTION ---
-        if current_waypoint_index < len(stored_path_meters_relative):
-            target_meters = stored_path_meters_relative[current_waypoint_index]
-            simulate_drone_goto(target_meters)
-
-            # In reality, you'd wait for confirmation here. We just move to the next.
-            current_waypoint_index += 1
-        else:
-            print("EXECUTION COMPLETE.")
-            state = DroneState.EXECUTION_DONE
-
-    elif state == DroneState.EXECUTION_DONE:
-         cv2.putText(display_frame, "State: EXECUTION DONE. Press 'r' to Reset.", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-         # Keep drawing the path
-         if len(stored_path_pixels) > 1:
-            cv2.polylines(display_frame, [np.array(stored_path_pixels)], isClosed=False, color=(0, 255, 0), thickness=3)
-
-
-    # --- Display ---
-    cv2.imshow("Green Mask", refined_mask)
-    cv2.imshow("Path Scanner/Executor", display_frame)
-
-    # --- Keyboard Controls ---
+    # --- Exit Condition (Press ESC) ---
     k = cv2.waitKey(1) & 0xFF
-    if k == 27: # ESC
+    if k == 27:
         print("Escape hit, closing...")
         break
-    elif k == ord('s') and state == DroneState.IDLE:
-        print("Starting Scan...")
-        state = DroneState.SCANNING
-    elif k == ord('g') and state == DroneState.PATH_STORED:
-        print("Starting Execution...")
-        # --- Convert stored pixel path to relative meters ---
-        stored_path_meters_relative = []
-        if stored_path_pixels and frame_center_when_scanned:
-            scan_center_x, scan_center_y = frame_center_when_scanned
-            # Optional: Find the top-leftmost point to start consistently
-            # start_index = np.argmin([p[0] + p[1] for p in stored_path_pixels]) # Heuristic for top-left
-            # path_to_process = stored_path_pixels[start_index:] + stored_path_pixels[:start_index] # Reorder
-            path_to_process = stored_path_pixels # Keep original order for now
-
-            # Reference point (first point in path) in pixel coords relative to scan center
-            ref_px, ref_py = path_to_process[0]
-            delta_ref_px = ref_px - scan_center_x
-            delta_ref_py = ref_py - scan_center_y
-
-            for i, (px, py) in enumerate(path_to_process):
-                delta_px = px - scan_center_x
-                delta_py = py - scan_center_y
-
-                # Calculate target meters relative to scan center
-                target_x_scan_relative = delta_px * PIXELS_TO_METERS_SCALE
-                target_y_scan_relative = -delta_py * PIXELS_TO_METERS_SCALE # Y inverted
-
-                # If it's the first point, the relative move is just its position
-                if i == 0:
-                    relative_move_x = target_x_scan_relative
-                    relative_move_y = target_y_scan_relative
-                else:
-                    # Calculate previous point's position relative to scan center
-                    prev_px, prev_py = path_to_process[i-1]
-                    delta_prev_px = prev_px - scan_center_x
-                    delta_prev_py = prev_py - scan_center_y
-                    prev_x_scan_relative = delta_prev_px * PIXELS_TO_METERS_SCALE
-                    prev_y_scan_relative = -delta_prev_py * PIXELS_TO_METERS_SCALE
-
-                    # The relative move is the difference from the previous waypoint
-                    # This might be better for some drone APIs (move BY dx, dy)
-                    # relative_move_x = target_x_scan_relative - prev_x_scan_relative
-                    # relative_move_y = target_y_scan_relative - prev_y_scan_relative
-
-                    # Alternative: Calculate absolute target relative to drone's *starting* position (where scan began)
-                    relative_move_x = target_x_scan_relative
-                    relative_move_y = target_y_scan_relative
-
-
-                stored_path_meters_relative.append((relative_move_x, relative_move_y))
-
-            current_waypoint_index = 0
-            state = DroneState.EXECUTING
-        else:
-            print("Error: No path stored or scan center missing.")
-
-    elif k == ord('r'): # Reset
-        print("Resetting state.")
-        stored_path_pixels = []
-        stored_path_meters_relative = []
-        current_waypoint_index = 0
-        frame_center_when_scanned = None
-        state = DroneState.IDLE
-
 
 # --- Cleanup ---
-tello.streamoff()
+send_drone_command("HOVER") # Ensure hover command is sent before exiting
+cam.release()
 cv2.destroyAllWindows()
