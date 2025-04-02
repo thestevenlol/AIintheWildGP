@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import math # For atan2
+from djitellopy import Tello 
 
 # --- Constants (Adjust these!) ---
 
@@ -39,20 +40,17 @@ def send_drone_command(command):
     print(f"COMMAND: {command}")
     # In a real application, you would send commands here
 
-# --- Webcam Setup ---
-cam = cv2.VideoCapture(0)
-
-if not cam.isOpened():
-    print("Error: Could not open webcam.")
-    exit()
+tello = Tello()
+tello.connect()
+tello.streamon()
 
 cv2.namedWindow("Line Following View (Black Line)")
 cv2.namedWindow("Black Line Mask (Refined)")
 
 # --- Processing Loop ---
 while True:
-    ret, frame = cam.read()
-    if not ret:
+    frame = tello.get_frame_read().frame
+    if not frame:
         print("Failed to grab frame")
         break
 
@@ -216,5 +214,5 @@ while True:
 
 # --- Cleanup ---
 send_drone_command("HOVER") # Ensure hover command is sent before exiting
-cam.release()
+tello.streamoff()   
 cv2.destroyAllWindows()
