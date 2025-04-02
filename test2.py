@@ -1,218 +1,320 @@
 import cv2
 import numpy as np
-import math # For atan2
-from djitellopy import Tello 
+import math
+import time
+from enum import Enum
+from djitellopy import Tello
 
-# --- Constants (Adjust these!) ---
+# --- States ---
+class DroneState(Enum):
+    IDLE = 0           # On the ground, disconnected or connected but not taken off
+    CONNECTED = 1      # Connected, on the ground
+    HOVERING = 2       # In the air, ready
+    SCANNING = 3       # In the air, performing scan
+    PATH_STORED = 4    # Scan complete, path stored, ready to execute
+    EXECUTING = 5      # Flying the stored path
+    EXECUTION_DONE = 6 # Path finished, hovering
+    LANDING = 7        # Landing sequence initiated
 
-# Grayscale Threshold (Lower value detects darker pixels as "black")
-# Tune this based on your lighting and how black the line is vs the background.
-# Values typically range from 50 to 150. Start around 100.
-GRAYSCALE_THRESHOLD = 40 # Pixels below this value are considered black
+# --- Constants ---
+# REMOVED: LOWER_GREEN, UPPER_GREEN
 
-# Morphological Kernel Size
-KERNEL_SIZE = 1 # Often needs to be slightly larger for thresholded images
+# Grayscale Threshold for Black Detection
+# Pixels with grayscale value BELOW this will be considered black (and turned white in the mask)
+BLACK_THRESHOLD_VALUE = 40 # <<<--- ADJUST THIS VALUE (Lower = stricter black, Higher = includes darker grays)
 
-# Morphological Iterations
-MORPH_ITERATIONS = 2 # Might need more iterations to clean up threshold noise
+# Morphological Operations
+KERNEL_SIZE = 2
+MORPH_ITERATIONS = 1 # Increase if mask is too noisy (try 2 or 3)
+MIN_CONTOUR_AREA = 100 # Pixels
 
-# Minimum Contour Area (Filter out small noise) - ADJUST THIS!
-MIN_CONTOUR_AREA = 150 # Pixels (adjust based on line thickness and distance)
+# --- Path Following Parameters ---
+CONTOUR_SIMPLIFICATION_FACTOR = 0.008 # Epsilon for approxPolyDP
 
-# --- Control Parameters ---
-# Horizontal Target Offset: Keep centroid slightly left of center (fraction of width)
-HORIZONTAL_TARGET_OFFSET_FRACTION = 0.0 # Target center for simplicity first
-# Horizontal Deadzone: How far from target before correcting (fraction of width)
-HORIZONTAL_DEADZONE_FRACTION = 0.15    # Correct if centroid > +/- 15% from target X
+# --- CRITICAL ASSUMPTION: Scale Factor ---
+PIXELS_TO_METERS_SCALE = 0.001 # <--- !!! MUST CALIBRATE THIS VALUE !!!
 
-# Vertical Slope Threshold: dy/dx threshold to trigger UP/DOWN
-# Steeper than this slope -> move UP/DOWN. Flatter -> HOVER vertically.
-# Adjust based on how sharp curves you expect. Higher value = less sensitive.
-VERTICAL_SLOPE_THRESHOLD = 0.3 # tan(angle) approx. 17 degrees
+# --- Tello Control Parameters ---
+TELLO_SPEED = 30  # Movement speed (cm/s) - START SLOW
+WAIT_TIME_BUFFER = 0.5 # Extra seconds to wait
 
-# Minimum Horizontal Span (dx) for Slope Calculation
-# Don't trust slope if line segment is too vertical or short horizontally
-MIN_DX_FOR_SLOPE = 20 # Pixels
+# --- Global Variables ---
+tello = None
+state = DroneState.IDLE
+stored_path_pixels = []
+current_waypoint_index = 0
+frame_reader = None
+last_frame = None
 
-# --- Drone Command Placeholder (Prints to Console) ---
-def send_drone_command(command):
-    """Prints the intended drone command to the console."""
-    print(f"COMMAND: {command}")
-    # In a real application, you would send commands here
+# --- Tello Functions (connect_tello, safe_takeoff, safe_land, cleanup - remain the same) ---
+def connect_tello():
+    global tello, state, frame_reader
+    try:
+        tello = Tello()
+        tello.connect()
+        print("Tello connected.")
+        print(f"Battery: {tello.get_battery()}%")
+        if tello.get_battery() < 20:
+            print("WARNING: Battery low! Landing recommended.")
+        tello.streamoff() # Ensure stream is off first
+        tello.streamon()
+        frame_reader = tello.get_frame_read()
+        time.sleep(1) # Allow stream to initialize
+        state = DroneState.CONNECTED
+        return True
+    except Exception as e:
+        print(f"Failed to connect to Tello: {e}")
+        tello = None
+        state = DroneState.IDLE
+        return False
 
-tello = Tello()
-tello.connect()
-tello.streamon()
+def safe_takeoff():
+    global state
+    if tello and state == DroneState.CONNECTED:
+        try:
+            print("Taking off...")
+            tello.takeoff()
+            time.sleep(2) # Allow takeoff to stabilize
+            state = DroneState.HOVERING
+            print("Hovering.")
+            return True
+        except Exception as e:
+            print(f"Takeoff failed: {e}")
+            try: tello.land()
+            except: pass
+            state = DroneState.CONNECTED # Remain connected but on ground
+            return False
+    return False
 
-cv2.namedWindow("Line Following View (Black Line)")
-cv2.namedWindow("Black Line Mask (Refined)")
+def safe_land():
+    global state
+    if tello and (state != DroneState.IDLE and state != DroneState.CONNECTED and state != DroneState.LANDING):
+        try:
+            state = DroneState.LANDING
+            print("Landing...")
+            tello.land()
+            time.sleep(3) # Allow landing
+            state = DroneState.CONNECTED # Back to connected state on ground
+            print("Landed.")
+            return True
+        except Exception as e:
+            print(f"Landing failed: {e}")
+            state = DroneState.CONNECTED
+            return False
+    return False
 
-# --- Processing Loop ---
-while True:
-    frame = tello.get_frame_read().frame
-    if not frame:
-        print("Failed to grab frame")
-        break
+def cleanup():
+    global tello, state
+    print("Cleaning up...")
+    if tello:
+        try:
+            if state not in [DroneState.IDLE, DroneState.CONNECTED, DroneState.LANDING]:
+                print("Auto-landing before exit...")
+                safe_land()
+            tello.streamoff()
+        except Exception as e:
+            print(f"Error during Tello cleanup: {e}")
+    cv2.destroyAllWindows()
+    print("Cleanup complete.")
 
-    frame_height, frame_width = frame.shape[:2]
-    frame_center_x = frame_width // 2
-    frame_center_y = frame_height // 2
+# --- Path Execution Function (execute_path_step - remains the same) ---
+def execute_path_step():
+    global current_waypoint_index, state
+    if not stored_path_pixels or current_waypoint_index >= len(stored_path_pixels):
+        print("Execution complete or no path.")
+        state = DroneState.EXECUTION_DONE
+        return
 
-    # Calculate target X based on offset
-    target_cx = frame_center_x + int(HORIZONTAL_TARGET_OFFSET_FRACTION * frame_width)
+    target_px, target_py = stored_path_pixels[current_waypoint_index]
+    if current_waypoint_index == 0:
+        print(f"Skipping move to first waypoint {current_waypoint_index}: ({target_px}, {target_py}) for now.")
+        current_waypoint_index += 1
+        if current_waypoint_index >= len(stored_path_pixels):
+            state = DroneState.EXECUTION_DONE
+        return
+    else:
+        prev_px, prev_py = stored_path_pixels[current_waypoint_index - 1]
 
-    # --- Image Processing for Black Line ---
-    # 1. Convert to Grayscale
-    gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    delta_px = target_px - prev_px
+    delta_py = target_py - prev_py
 
-    # 2. Apply Binary Threshold (Inverted)
-    # Pixels below GRAYSCALE_THRESHOLD become white (255), others become black (0)
-    # This makes the black line white in the mask, which findContours expects.
-    ret, thresh_mask = cv2.threshold(gray_image, GRAYSCALE_THRESHOLD, 255, cv2.THRESH_BINARY_INV)
+    dx_meters = delta_px * PIXELS_TO_METERS_SCALE
+    dy_meters = -delta_py * PIXELS_TO_METERS_SCALE
 
-    # 3. Morphological Operations (Closing) - To fill gaps in the line and remove noise
-    kernel = np.ones((KERNEL_SIZE, KERNEL_SIZE), np.uint8)
-    # Closing = Dilation followed by Erosion
-    refined_mask = cv2.morphologyEx(thresh_mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_ITERATIONS)
-    # Optional: Add Opening (Erosion then Dilation) to remove small white noise specks (background noise)
-    # refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, kernel, iterations=1) # Uncomment if needed
+    tello_x_cm = 0
+    tello_y_cm = -dx_meters * 100
+    tello_z_cm = dy_meters * 100
 
-    # --- Contour Detection and Filtering ---
-    # Find contours on the refined mask (where the line should be white)
-    contours, hierarchy = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    tello_y_cm = int(np.clip(tello_y_cm, -500, 500))
+    tello_z_cm = int(np.clip(tello_z_cm, -500, 500))
 
-    largest_contour = None
-    max_area = 0
-    line_found = False
-    cx, cy = 0, 0 # Centroid coordinates
-    leftmost_pt = None
-    rightmost_pt = None
-    line_angle_deg = 0
+    if abs(tello_y_cm) < 5 and abs(tello_z_cm) < 5:
+         print(f"Skipping tiny move for waypoint {current_waypoint_index}.")
+         current_waypoint_index += 1
+         return
 
-    if contours:
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > MIN_CONTOUR_AREA and area > max_area:
-                max_area = area
-                largest_contour = contour
+    distance_cm = math.sqrt(tello_y_cm**2 + tello_z_cm**2)
+    wait_time = (distance_cm / TELLO_SPEED) + WAIT_TIME_BUFFER
 
-    # --- Analysis if Line Found ---
-    command_h = "HOVER_H" # Horizontal component (LEFT, RIGHT, HOVER_H)
-    command_v = "HOVER_V" # Vertical component (UP, DOWN, HOVER_V)
-    final_command = "SEARCH" # Default if no line
+    print(f"Executing step to waypoint {current_waypoint_index}:")
+    print(f"  Delta Pixels: ({delta_px}, {delta_py})")
+    print(f"  Delta Meters: ({dx_meters:.3f}, {dy_meters:.3f})")
+    print(f"  Tello Cmd (X,Y,Z cm): ({tello_x_cm}, {tello_y_cm}, {tello_z_cm})")
+    print(f"  Est. Time: {wait_time:.2f}s")
 
-    if largest_contour is not None:
-        line_found = True
-        final_command = "HOVER" # Default if line is found but centered/flat
+    try:
+        tello.go_xyz_speed(tello_x_cm, tello_y_cm, tello_z_cm, TELLO_SPEED)
+        time.sleep(wait_time)
+        current_waypoint_index += 1
+        if current_waypoint_index >= len(stored_path_pixels):
+            print("Execution finished.")
+            state = DroneState.EXECUTION_DONE
+    except Exception as e:
+        print(f"Error during Tello movement: {e}")
+        print("Aborting execution and attempting to hover.")
+        try:
+            tello.send_rc_control(0,0,0,0)
+        except: pass
+        state = DroneState.HOVERING
 
-        # Calculate centroid
-        M = cv2.moments(largest_contour)
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
+# --- Main Loop ---
+if connect_tello():
+    try:
+        cv2.namedWindow("Tello Path Scanner")
+        cv2.namedWindow("Black Mask") # <-- Renamed window
 
-            # Find leftmost and rightmost points of the contour
-            leftmost_pt = tuple(largest_contour[largest_contour[:, :, 0].argmin()][0])
-            rightmost_pt = tuple(largest_contour[largest_contour[:, :, 0].argmax()][0])
+        while True:
+            if not tello:
+                print("Tello connection lost.")
+                break
 
-            # Draw contour, centroid, and end points on the original frame
-            cv2.drawContours(frame, [largest_contour], -1, (0, 255, 0), 2) # Green contour
-            cv2.circle(frame, (cx, cy), 7, (0, 0, 255), -1) # Red centroid
-            cv2.circle(frame, leftmost_pt, 5, (255, 0, 0), -1) # Blue left
-            cv2.circle(frame, rightmost_pt, 5, (0, 255, 255), -1) # Yellow right
-            if leftmost_pt and rightmost_pt:
-                 cv2.line(frame, leftmost_pt, rightmost_pt, (255, 0, 255), 1) # Magenta line segment
+            frame = frame_reader.frame
+            if frame is None:
+                print("No frame received")
+                time.sleep(0.1)
+                continue
 
-            # --- Determine Horizontal Command (Turning) ---
-            h_deadzone_pixels = int(HORIZONTAL_DEADZONE_FRACTION * frame_width / 2)
-            left_bound = target_cx - h_deadzone_pixels
-            right_bound = target_cx + h_deadzone_pixels
+            frame_height, frame_width = frame.shape[:2]
+            display_frame = frame.copy()
 
-            if cx < left_bound:
-                command_h = "LEFT"
-            elif cx > right_bound:
-                command_h = "RIGHT"
-            else:
-                command_h = "HOVER_H" # Horizontally within deadzone of target
+            # --- Image Processing for Black Detection ---
+            gray_image = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Thresholding: Pixels below BLACK_THRESHOLD_VALUE become white (255), others black (0)
+            ret, initial_mask = cv2.threshold(gray_image, BLACK_THRESHOLD_VALUE, 255, cv2.THRESH_BINARY_INV)
 
-            # --- Determine Vertical Command (Up/Down based on slope) ---
-            dx = rightmost_pt[0] - leftmost_pt[0]
-            # Note: Image coordinates: Positive dy means downwards on the screen
-            dy = rightmost_pt[1] - leftmost_pt[1]
+            # Morphological Closing to clean up mask
+            kernel = np.ones((KERNEL_SIZE, KERNEL_SIZE), np.uint8)
+            refined_mask = cv2.morphologyEx(initial_mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_ITERATIONS)
+            # Optional: Add Opening first if you have small black noise spots you want removed
+            # refined_mask = cv2.morphologyEx(initial_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+            # refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_ITERATIONS)
 
-            if abs(dx) > MIN_DX_FOR_SLOPE: # Check if segment is wide enough horizontally
-                slope = dy / dx
-                line_angle_deg = math.degrees(math.atan2(-dy, dx)) # Angle CCW from positive X axis
+            # --- State Machine Logic & Display (Mostly unchanged) ---
+            status_text = f"State: {state.name} | Bat: {tello.get_battery()}%"
+            controls_text = ""
 
-                # If the line goes up on screen (left to right), dy is negative, slope is negative
-                if slope < -VERTICAL_SLOPE_THRESHOLD: # Significantly upwards slope on screen
-                    command_v = "UP"
-                # If the line goes down on screen (left to right), dy is positive, slope is positive
-                elif slope > VERTICAL_SLOPE_THRESHOLD: # Significantly downwards slope on screen
-                    command_v = "DOWN"
-                else: # Mostly horizontal slope
-                    command_v = "HOVER_V"
-            else:
-                # Line is near vertical or very short horizontally
-                # Use centroid's vertical position relative to center as fallback
-                if cy < frame_center_y - 30: # Above center (adjust threshold as needed)
-                     command_v = "UP"
-                elif cy > frame_center_y + 30: # Below center (adjust threshold as needed)
-                     command_v = "DOWN"
+            if state == DroneState.IDLE:
+                status_text = "State: IDLE (Not Connected?)"
+                controls_text = "Press 'c' to Connect"
+            # ... (other states remain the same, displaying status and controls) ...
+            elif state == DroneState.CONNECTED:
+                controls_text = "Press 't' to Takeoff"
+            elif state == DroneState.HOVERING:
+                controls_text = "Press 's' to Scan Path | 'l' to Land"
+            elif state == DroneState.SCANNING:
+                status_text += " (Scanning...)"
+                # --- Scanning Logic (Uses refined_mask from black detection) ---
+                contours, _ = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE) # Use refined_mask
+                largest_contour = None
+                max_area = 0
+                if contours:
+                    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+                    if cv2.contourArea(contours[0]) > MIN_CONTOUR_AREA:
+                         largest_contour = contours[0]
+
+                if largest_contour is not None:
+                    perimeter = cv2.arcLength(largest_contour, True)
+                    epsilon = CONTOUR_SIMPLIFICATION_FACTOR * perimeter
+                    simplified_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+                    stored_path_pixels = [tuple(pt[0]) for pt in simplified_contour]
+
+                    if len(stored_path_pixels) > 1:
+                        print(f"Path Scanned: {len(stored_path_pixels)} waypoints.")
+                        if stored_path_pixels[0][0] > stored_path_pixels[-1][0]:
+                            print("Path seems right-to-left, reversing for execution.")
+                            stored_path_pixels.reverse()
+                        state = DroneState.PATH_STORED
+                    else:
+                        print("Scan failed: Not enough points after simplification.")
+                        state = DroneState.HOVERING
                 else:
-                     command_v = "HOVER_V" # Vertically centered
+                    print("Scan failed: No suitable contour found.")
+                    state = DroneState.HOVERING
 
-            # --- Combine Commands (Prioritize Turning) ---
-            if command_h != "HOVER_H":
-                final_command = command_h # Turn if needed
-            elif command_v != "HOVER_V":
-                final_command = command_v # Move vertically if horizontally ok
-            else:
-                final_command = "HOVER" # Stay put if centered and flat segment
+            elif state == DroneState.PATH_STORED:
+                controls_text = "Press 'g' to Go | 'r' to Rescan | 'l' to Land"
+                if len(stored_path_pixels) > 1:
+                    path_np = np.array(stored_path_pixels)
+                    cv2.polylines(display_frame, [path_np], isClosed=False, color=(0, 255, 0), thickness=3)
+                    for i, pt in enumerate(stored_path_pixels):
+                         cv2.circle(display_frame, pt, 4, (0, 0, 255), -1)
 
-        else:
-             # Centroid calculation failed (m00 was zero)
-             line_found = False
-             final_command = "HOVER" # Or maybe SEARCH? Hover seems safer.
+            elif state == DroneState.EXECUTING:
+                 status_text += f" (Waypoint {current_waypoint_index}/{len(stored_path_pixels)})"
+                 controls_text = "Executing... Press 'l' for EMERGENCY LAND"
+                 if len(stored_path_pixels) > 1:
+                     path_np = np.array(stored_path_pixels)
+                     cv2.polylines(display_frame, [path_np], isClosed=False, color=(0, 165, 255), thickness=2)
+                     if current_waypoint_index < len(stored_path_pixels):
+                         target_pixel_pt = stored_path_pixels[current_waypoint_index]
+                         cv2.circle(display_frame, target_pixel_pt, 8, (0, 0, 255), -1)
+                 execute_path_step()
 
-    else:
-        # No significant contour found
-        line_found = False
-        final_command = "SEARCH"
-
-    # --- Send Command to Console ---
-    send_drone_command(final_command)
-
-    # --- Display Information ---
-    # Draw target X and deadzone
-    cv2.line(frame, (target_cx, 0), (target_cx, frame_height), (0, 255, 0), 1) # Green target X
-    left_bound_viz = target_cx - int(HORIZONTAL_DEADZONE_FRACTION * frame_width / 2)
-    right_bound_viz = target_cx + int(HORIZONTAL_DEADZONE_FRACTION * frame_width / 2)
-    cv2.line(frame, (left_bound_viz, 0), (left_bound_viz, frame_height), (255, 255, 0), 1) # Cyan left bound
-    cv2.line(frame, (right_bound_viz, 0), (right_bound_viz, frame_height), (255, 255, 0), 1) # Cyan right bound
-
-
-    cv2.putText(frame, f"Command: {final_command}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-    if line_found:
-        cv2.putText(frame, f"Centroid: ({cx}, {cy}) TargetX: {target_cx}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-        cv2.putText(frame, f"L:{leftmost_pt} R:{rightmost_pt}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-        cv2.putText(frame, f"Angle: {line_angle_deg:.1f} deg", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-        cv2.putText(frame, f"Threshold: {GRAYSCALE_THRESHOLD}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
-    else:
-         cv2.putText(frame, "Line not found", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
-         cv2.putText(frame, f"Threshold: {GRAYSCALE_THRESHOLD}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+            elif state == DroneState.EXECUTION_DONE:
+                controls_text = "Press 'r' to Reset (Hover) | 'l' to Land"
+                if len(stored_path_pixels) > 1:
+                    path_np = np.array(stored_path_pixels)
+                    cv2.polylines(display_frame, [path_np], isClosed=False, color=(0, 255, 0), thickness=3)
+            elif state == DroneState.LANDING:
+                 status_text = "State: LANDING..."
 
 
-    cv2.imshow("Black Line Mask (Refined)", refined_mask)
-    cv2.imshow("Line Following View (Black Line)", frame)
+            # --- Display Info Text ---
+            cv2.putText(display_frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            cv2.putText(display_frame, controls_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
-    # --- Exit Condition (Press ESC) ---
-    k = cv2.waitKey(1) & 0xFF
-    if k == 27:
-        print("Escape hit, closing...")
-        break
+            # --- Show Windows ---
+            cv2.imshow("Tello Path Scanner", display_frame)
+            cv2.imshow("Black Mask", refined_mask) # <-- Show the black mask
 
-# --- Cleanup ---
-send_drone_command("HOVER") # Ensure hover command is sent before exiting
-tello.streamoff()   
-cv2.destroyAllWindows()
+            # --- Keyboard Controls (Remain the same) ---
+            k = cv2.waitKey(1) & 0xFF
+            if k == 27: # ESC
+                print("ESC pressed. Landing and exiting.")
+                break
+            elif k == ord('c') and state == DroneState.IDLE:
+                 connect_tello()
+            elif k == ord('t') and state == DroneState.CONNECTED:
+                 safe_takeoff()
+            elif k == ord('l'): # Land
+                 print("Landing initiated by keypress.")
+                 safe_land()
+            elif k == ord('s') and state == DroneState.HOVERING:
+                 print("Starting Scan...")
+                 state = DroneState.SCANNING
+            elif k == ord('g') and state == DroneState.PATH_STORED:
+                 print("Starting Path Execution...")
+                 current_waypoint_index = 0
+                 state = DroneState.EXECUTING
+            elif k == ord('r') and (state == DroneState.PATH_STORED or state == DroneState.EXECUTION_DONE):
+                 print("Resetting path and returning to Hovering.")
+                 stored_path_pixels = []
+                 current_waypoint_index = 0
+                 state = DroneState.HOVERING
+
+    except Exception as e:
+        print(f"An error occurred in the main loop: {e}")
+    finally:
+        cleanup()
+else:
+    print("Could not connect to Tello. Exiting.")
