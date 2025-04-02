@@ -13,8 +13,8 @@ class DroneState(Enum):
     EXECUTION_DONE = 4
 
 # --- Constants ---
-LOWER_GREEN = np.array([35, 50, 50])
-UPPER_GREEN = np.array([85, 255, 255])
+LOWER_GREEN = np.array([0, 0, 0])  
+UPPER_GREEN = np.array([180, 255, 30])
 KERNEL_SIZE = 3
 MORPH_ITERATIONS = 1
 MIN_CONTOUR_AREA = 100
