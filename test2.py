@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import math
 from enum import Enum # For states
+from djitellopy import Tello
 
 # --- States ---
 class DroneState(Enum):
@@ -35,6 +36,10 @@ stored_path_pixels = []
 stored_path_meters_relative = []
 current_waypoint_index = 0
 
+tello = Tello()
+tello.connect()
+tello.streamon()
+
 def simulate_drone_goto(target_meters_relative):
     """Simulates telling the drone to move to a relative position."""
     # Assumes target is relative to where the drone was when execution started.
@@ -45,12 +50,6 @@ def simulate_drone_goto(target_meters_relative):
     # drone.goto_position_relative(target_meters_relative[0], target_meters_relative[1], 0, speed=...)
     # wait_until_drone_reaches_target()
 
-# --- Webcam Setup ---
-cam = cv2.VideoCapture(0)
-if not cam.isOpened():
-    print("Error: Could not open webcam.")
-    exit()
-
 cv2.namedWindow("Path Scanner/Executor")
 cv2.namedWindow("Green Mask")
 
@@ -59,8 +58,8 @@ frame_center_when_scanned = None # Store center point during scan
 
 # --- Processing Loop ---
 while True:
-    ret, frame = cam.read()
-    if not ret:
+    frame = tello.get_frame_read().frame
+    if frame is not None:
         print("Failed to grab frame")
         break
 
@@ -233,5 +232,5 @@ while True:
 
 
 # --- Cleanup ---
-cam.release()
+tello.streamoff()
 cv2.destroyAllWindows()
