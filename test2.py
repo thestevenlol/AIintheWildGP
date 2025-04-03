@@ -15,6 +15,7 @@ class DroneState(Enum):
     EXECUTING = 5      # Flying the stored path
     EXECUTION_DONE = 6 # Path finished, hovering
     LANDING = 7        # Landing sequence initiated
+    RETURN_TO_START = 8 
 
 # --- Constants ---
 # REMOVED: LOWER_GREEN, UPPER_GREEN
@@ -35,8 +36,9 @@ CONTOUR_SIMPLIFICATION_FACTOR = 0.008 # Epsilon for approxPolyDP
 PIXELS_TO_METERS_SCALE = 0.001 # <--- !!! MUST CALIBRATE THIS VALUE !!!
 
 # --- Tello Control Parameters ---
-TELLO_SPEED = 30  # Movement speed (cm/s) - START SLOW
+TELLO_SPEED = 10  # Movement speed (cm/s) - START SLOW
 WAIT_TIME_BUFFER = 0.5 # Extra seconds to wait
+TELLO_LANDING_TIME = 40 # Time to wait for landing (seconds)
 
 # --- Global Variables ---
 tello = None
@@ -122,12 +124,13 @@ def execute_path_step():
     global current_waypoint_index, state
     if not stored_path_pixels or current_waypoint_index >= len(stored_path_pixels):
         print("Execution complete or no path.")
-        state = DroneState.EXECUTION_DONE
+        state = DroneState.RETURN_TO_START
         return
 
     target_px, target_py = stored_path_pixels[current_waypoint_index]
     if current_waypoint_index == 0:
         print(f"Skipping move to first waypoint {current_waypoint_index}: ({target_px}, {target_py}) for now.")
+        stored_path_pixels.append(stored_path_pixels.pop(0)) # Move first waypoint to end
         current_waypoint_index += 1
         if current_waypoint_index >= len(stored_path_pixels):
             state = DroneState.EXECUTION_DONE
@@ -135,6 +138,7 @@ def execute_path_step():
     else:
         prev_px, prev_py = stored_path_pixels[current_waypoint_index - 1]
 
+    # Distance formula starts here
     delta_px = target_px - prev_px
     delta_py = target_py - prev_py
 
@@ -154,6 +158,9 @@ def execute_path_step():
          return
 
     distance_cm = math.sqrt(tello_y_cm**2 + tello_z_cm**2)
+    # Distance formula ends here
+    
+    # Larger distance = more acceleration, therefore more wait time to stabilize.
     wait_time = (distance_cm / TELLO_SPEED) + WAIT_TIME_BUFFER
 
     print(f"Executing step to waypoint {current_waypoint_index}:")
@@ -163,6 +170,22 @@ def execute_path_step():
     print(f"  Est. Time: {wait_time:.2f}s")
 
     try:
+        # Additional clamping.
+        if tello_x_cm > -20 and tello_x_cm < 0: 
+            tello_x_cm = -20
+        if tello_x_cm > 0 and tello_x_cm < 20:
+            tello_x_cm = 20
+
+        if tello_y_cm > -20 and tello_y_cm < 0:
+            tello_y_cm = -20
+        if tello_y_cm > 0 and tello_y_cm < 20:  
+            tello_y_cm = 20
+
+        if tello_z_cm > -20 and tello_z_cm < 0:
+            tello_z_cm = -20
+        if tello_z_cm > 0 and tello_z_cm < 20:
+            tello_z_cm = 20
+
         tello.go_xyz_speed(tello_x_cm, tello_y_cm, tello_z_cm, TELLO_SPEED)
         time.sleep(wait_time)
         current_waypoint_index += 1
@@ -173,6 +196,7 @@ def execute_path_step():
         print(f"Error during Tello movement: {e}")
         print("Aborting execution and attempting to hover.")
         try:
+            # Attempt to hover in place
             tello.send_rc_control(0,0,0,0)
         except: pass
         state = DroneState.HOVERING
@@ -229,10 +253,13 @@ if connect_tello():
                 max_area = 0
                 if contours:
                     contours = sorted(contours, key=cv2.contourArea, reverse=True)
+                    # Check if there is a suitable contour.
                     if cv2.contourArea(contours[0]) > MIN_CONTOUR_AREA:
                          largest_contour = contours[0]
 
                 if largest_contour is not None:
+                    # Smooth out path using approxPolyDP
+                    # Episilon is a parameter that determines the approximation accuracy
                     perimeter = cv2.arcLength(largest_contour, True)
                     epsilon = CONTOUR_SIMPLIFICATION_FACTOR * perimeter
                     simplified_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
@@ -255,7 +282,7 @@ if connect_tello():
                 controls_text = "Press 'g' to Go | 'r' to Rescan | 'l' to Land"
                 if len(stored_path_pixels) > 1:
                     path_np = np.array(stored_path_pixels)
-                    cv2.polylines(display_frame, [path_np], isClosed=False, color=(0, 255, 0), thickness=3)
+                    cv2.polylines(display_frame, [path_np], isClosed=True, color=(0, 255, 0), thickness=3)
                     for i, pt in enumerate(stored_path_pixels):
                          cv2.circle(display_frame, pt, 4, (0, 0, 255), -1)
 
@@ -264,9 +291,12 @@ if connect_tello():
                  controls_text = "Executing... Press 'l' for EMERGENCY LAND"
                  if len(stored_path_pixels) > 1:
                      path_np = np.array(stored_path_pixels)
-                     cv2.polylines(display_frame, [path_np], isClosed=False, color=(0, 165, 255), thickness=2)
+                     cv2.polylines(display_frame, [path_np], isClosed=True, color=(0, 165, 255), thickness=2)
                      if current_waypoint_index < len(stored_path_pixels):
                          target_pixel_pt = stored_path_pixels[current_waypoint_index]
+                         if stored_path_pixels[current_waypoint_index + 1] is not None:
+                             next_pixel_pt = stored_path_pixels[current_waypoint_index + 1]
+                             cv2.circle(display_frame, next_pixel_pt, 8, (0, 255, 0), -1) 
                          cv2.circle(display_frame, target_pixel_pt, 8, (0, 0, 255), -1)
                  execute_path_step()
 
@@ -275,6 +305,11 @@ if connect_tello():
                 if len(stored_path_pixels) > 1:
                     path_np = np.array(stored_path_pixels)
                     cv2.polylines(display_frame, [path_np], isClosed=False, color=(0, 255, 0), thickness=3)
+            elif state == DroneState.RETURN_TO_START:
+                print("Returning to start...")
+                stored_path_pixels.reverse()  # Reverse the path
+                current_waypoint_index = 0
+                state = DroneState.EXECUTING
             elif state == DroneState.LANDING:
                  status_text = "State: LANDING..."
 
